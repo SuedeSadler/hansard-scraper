@@ -1,20 +1,15 @@
 /**
  * Hansard Scraper — hansard.parliament.nz
  *
- * Uses Playwright to pass Radware bot protection,
- * extracts session cookies, then uses those cookies
- * for direct API calls to fetch transcripts efficiently.
- *
- * Flow:
- * 1. Playwright loads one page to get Radware cookies
- * 2. Cookies passed to fetch() for all subsequent API calls
- * 3. No browser needed per page — just one warm-up load
+ * Pure Playwright approach — loads each transcript page,
+ * waits for the specific HpsByToc elements to render,
+ * then extracts and parses speeches.
  *
  * Features:
- * - Single browser session for cookie extraction
- * - Direct API calls after cookie handshake
+ * - Waits for exact DOM elements rather than text length guessing
  * - Checkpoint system — restarts pick up where they left off
  * - Batched embeddings — 20 chunks per OpenAI call
+ * - Skips non-sitting days automatically
  */
 
 const { chromium } = require('playwright');
@@ -29,11 +24,10 @@ const OPENAI_KEY    = process.env.OPENAI_KEY;
 const CHUNK_SIZE    = 400;
 const CHUNK_OVERLAP = 50;
 const BATCH_SIZE    = 20;
-const DELAY_MS      = 800;
+const DELAY_MS      = 1500;
 const DAYS_BACK     = 730; // change to 14 for weekly runs
 
-const API_BASE    = 'https://hansard.parliament.nz/api/resources/transcript';
-const WARMUP_URL  = 'https://hansard.parliament.nz/hansard-transcript/2026-06-24?lang=en';
+const BASE_URL = 'https://hansard.parliament.nz';
 
 const TARGET_MPS = [
   'CHRISTOPHER LUXON',
@@ -131,104 +125,39 @@ function getSittingDayDates(daysBack) {
   return dates;
 }
 
-// ── COOKIE EXTRACTION ────────────────────────────────────────────────────
-// Load one real page with Playwright to pass Radware bot check
-// Extract all cookies and return as a header string for fetch()
+// ── SCRAPE A SINGLE DAY ──────────────────────────────────────────────────
 
-async function getSessionCookies() {
-  console.log('Launching browser to pass bot protection...');
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    locale: 'en-NZ',
-  });
-
-  const page = await context.newPage();
+async function scrapeDay(page, date) {
+  const url = `${BASE_URL}/hansard-transcript/${date}?lang=en`;
 
   try {
-    // Load a real page so Radware sets its cookies
-    await page.goto(WARMUP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Wait for Radware challenge to complete — it sets cookies then redirects
-    await page.waitForFunction(
-      () => {
-        const text = document.body.innerText || '';
-        return text.length > 500 && !text.includes('Verifying') && !text.includes('Radware');
-      },
-      { timeout: 30000, polling: 1000 }
-    ).catch(() => {
-      console.log('Radware wait timed out — proceeding with whatever cookies we have');
-    });
+    // Wait specifically for HpsByToc spans — these are the speaker elements
+    // If they don't appear within 45s, there was no sitting this day
+    try {
+      await page.waitForSelector('[class*="HpsByToc"], .HpsByToc', {
+        timeout: 45000,
+      });
+    } catch {
+      return { skipped: true, reason: 'no content' };
+    }
 
-    await sleep(2000);
+    // Small buffer for remaining content to render
+    await sleep(DELAY_MS);
 
-    // Extract all cookies from the browser context
-    const cookies = await context.cookies();
-    const cookieHeader = cookies
-      .map(c => `${c.name}=${c.value}`)
-      .join('; ');
+    // Extract innerHTML — we need the HTML structure for parsing
+    const html = await page.evaluate(() => document.body.innerHTML);
 
-    console.log(`Got ${cookies.length} cookies from browser session.\n`);
+    if (!html || html.length < 500) {
+      return { skipped: true, reason: 'no content' };
+    }
 
-    // Also grab the user agent for consistency
-    const userAgent = await page.evaluate(() => navigator.userAgent);
+    return { html, skipped: false };
 
-    return { cookieHeader, userAgent };
-
-  } finally {
-    await browser.close();
+  } catch (err) {
+    return { skipped: true, reason: err.message };
   }
-}
-
-// ── FETCH TRANSCRIPT ─────────────────────────────────────────────────────
-
-async function fetchTranscript(date, cookieHeader, userAgent) {
-  const url = `${API_BASE}/${date}`;
-
-  const res = await fetch(url, {
-    headers: {
-      'Accept': 'application/json, text/html, */*',
-      'Accept-Language': 'en-NZ,en;q=0.9',
-      'Referer': `https://hansard.parliament.nz/hansard-transcript/${date}?lang=en`,
-      'Origin': 'https://hansard.parliament.nz',
-      'User-Agent': userAgent,
-      'Cookie': cookieHeader,
-      'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-      'sec-ch-ua-mobile': '?0',
-      'Sec-Fetch-Dest': 'empty',
-      'Sec-Fetch-Mode': 'cors',
-      'Sec-Fetch-Site': 'same-origin',
-    },
-  });
-
-  if (res.status === 404 || res.status === 204) return null;
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-  const text = await res.text();
-
-  // Check if we got blocked again
-  if (text.includes('Radware') || text.includes('Verifying') || text.length < 200) {
-    throw new Error('Bot protection triggered — cookies may have expired');
-  }
-
-  // API returns a JSON-encoded HTML string
-  let html = text;
-  if (text.trim().startsWith('"')) {
-    html = JSON.parse(text);
-  }
-
-  return html;
 }
 
 // ── PARSE SPEECHES ───────────────────────────────────────────────────────
@@ -236,9 +165,9 @@ async function fetchTranscript(date, cookieHeader, userAgent) {
 function parseSpeeches(html) {
   const speeches = [];
 
-  // Speaker names are in <span class="HpsByToc"> tags
-  // Format: SPEAKER NAME (Role) (HH:MM)
-  const speakerBlockRegex = /<span class="HpsByToc"[^>]*>([\s\S]+?)<\/span>\s*:([\s\S]+?)(?=<a name="member"|<span class="HpsByToc"|<span class="HpsProceedingHeading"|<span class="HpsSubjectHeading"|$)/gi;
+  // Target <span class="HpsByToc"> which contains speaker name + time
+  // Everything after the colon until the next speaker block is the speech
+  const speakerBlockRegex = /<span[^>]*class="[^"]*HpsByToc[^"]*"[^>]*>([\s\S]+?)<\/span>\s*:([\s\S]+?)(?=<a name="member"|<span[^>]*HpsByToc|<span[^>]*HpsProceedingHeading|<span[^>]*HpsSubjectHeading|$)/gi;
 
   let match;
   while ((match = speakerBlockRegex.exec(html)) !== null) {
@@ -247,7 +176,7 @@ function parseSpeeches(html) {
 
     if (text.split(' ').length < 25) continue;
 
-    // Extract name before first bracket
+    // Extract name — everything before the first (
     const namePart = speakerRaw.split('(')[0].trim();
 
     if (['SPEAKER', 'CLERK', 'CHAIRPERSON', 'ASSISTANT SPEAKER'].some(s => namePart.includes(s))) continue;
@@ -320,7 +249,7 @@ async function processDay(date, html) {
         mp_name: speech.mpName,
         debate_title: `Hansard ${date}`,
         debate_date: date,
-        debate_url: `https://hansard.parliament.nz/hansard-transcript/${date}?lang=en`,
+        debate_url: `${BASE_URL}/hansard-transcript/${date}?lang=en`,
         chunk_index: i,
         content,
         embedding: null,
@@ -352,69 +281,67 @@ async function run() {
   console.log('║       Hansard Scraper — Starting         ║');
   console.log('╚══════════════════════════════════════════╝\n');
 
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-NZ',
+  });
+
+  const page = await context.newPage();
+
   let totalChunks   = 0;
   let daysProcessed = 0;
   let daysNoSitting = 0;
   let daysErrored   = 0;
 
-  // Step 1 — get session cookies via Playwright
-  const { cookieHeader, userAgent } = await getSessionCookies();
+  try {
+    const scrapedDates = await getScrapedDates();
+    console.log(`Checkpoint: ${scrapedDates.size} days already indexed.\n`);
 
-  // Step 2 — load checkpoint
-  const scrapedDates = await getScrapedDates();
-  console.log(`Checkpoint: ${scrapedDates.size} days already indexed.\n`);
+    const allDates = getSittingDayDates(DAYS_BACK);
+    const toScrape = allDates.filter(d => !scrapedDates.has(d));
 
-  const allDates = getSittingDayDates(DAYS_BACK);
-  const toScrape = allDates.filter(d => !scrapedDates.has(d));
+    console.log(`Sitting days in range: ${allDates.length}`);
+    console.log(`Already scraped:       ${allDates.length - toScrape.length}`);
+    console.log(`To scrape now:         ${toScrape.length}\n`);
 
-  console.log(`Sitting days in range: ${allDates.length}`);
-  console.log(`Already scraped:       ${allDates.length - toScrape.length}`);
-  console.log(`To scrape now:         ${toScrape.length}\n`);
+    for (let i = 0; i < toScrape.length; i++) {
+      const date     = toScrape[i];
+      const progress = `[${i + 1}/${toScrape.length}]`;
 
-  // Step 3 — fetch and process each day via API
-  for (let i = 0; i < toScrape.length; i++) {
-    const date     = toScrape[i];
-    const progress = `[${i + 1}/${toScrape.length}]`;
+      process.stdout.write(`${progress} ${date} — `);
 
-    process.stdout.write(`${progress} ${date} — `);
+      const result = await scrapeDay(page, date);
 
-    try {
-      await sleep(DELAY_MS);
-
-      const html = await fetchTranscript(date, cookieHeader, userAgent);
-
-      if (!html) {
-        process.stdout.write(`no sitting\n`);
-        daysNoSitting++;
+      if (result.skipped) {
+        const reason = result.reason === 'no content' ? 'no sitting' : `error: ${result.reason}`;
+        process.stdout.write(`${reason}\n`);
+        result.reason === 'no content' ? daysNoSitting++ : daysErrored++;
         await markDateScraped(date, 0, true);
         continue;
       }
 
-      const chunksAdded = await processDay(date, html);
+      const chunksAdded = await processDay(date, result.html);
       await markDateScraped(date, chunksAdded);
 
       totalChunks += chunksAdded;
       daysProcessed++;
 
       process.stdout.write(`✓ ${chunksAdded} chunks\n`);
-
-    } catch (err) {
-      // If bot protection triggers mid-run, refresh cookies and retry once
-      if (err.message.includes('Bot protection')) {
-        console.log('\nBot protection triggered — refreshing cookies...');
-        try {
-          const fresh = await getSessionCookies();
-          Object.assign({ cookieHeader, userAgent }, fresh);
-          i--; // retry this date
-        } catch (refreshErr) {
-          process.stdout.write(`cookie refresh failed: ${refreshErr.message}\n`);
-          daysErrored++;
-        }
-      } else {
-        process.stdout.write(`error: ${err.message}\n`);
-        daysErrored++;
-      }
     }
+
+  } finally {
+    await browser.close();
   }
 
   console.log('\n╔══════════════════════════════════════════╗');
