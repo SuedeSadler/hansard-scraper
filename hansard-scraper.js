@@ -1,19 +1,16 @@
 /**
  * Hansard Scraper — hansard.parliament.nz
  *
- * Generates sitting day URLs directly from dates (no listing page needed),
- * scrapes each transcript with Playwright, parses speeches by MP,
- * batch embeds via OpenAI, and stores in Supabase pgvector.
+ * Generates sitting day URLs directly from dates,
+ * waits for Blazor WebAssembly to render content,
+ * parses speeches by MP, batch embeds via OpenAI,
+ * and stores in Supabase pgvector.
  *
  * Features:
+ * - Blazor-aware page waiting (polls until content renders)
  * - Date-based URL generation — no listing page crawling
  * - Checkpoint system — restarts pick up where they left off
  * - Batched embeddings — 20 chunks per API call
- * - Skips non-sitting days automatically
- *
- * Setup:
- *   npm install playwright @supabase/supabase-js openai
- *   npx playwright install chromium
  */
 
 const { chromium } = require('playwright');
@@ -25,15 +22,14 @@ const SUPABASE_URL  = process.env.SUPABASE_URL;
 const SUPABASE_KEY  = process.env.SUPABASE_KEY;
 const OPENAI_KEY    = process.env.OPENAI_KEY;
 
-const CHUNK_SIZE    = 400;   // words per chunk
-const CHUNK_OVERLAP = 50;    // word overlap between chunks
-const BATCH_SIZE    = 20;    // chunks per OpenAI embedding call
-const DELAY_MS      = 2000;  // ms between page requests
-const DAYS_BACK     = 730;   // 2 years for initial scrape, change to 14 for weekly
+const CHUNK_SIZE    = 400;
+const CHUNK_OVERLAP = 50;
+const BATCH_SIZE    = 20;
+const DELAY_MS      = 1500;
+const DAYS_BACK     = 730; // 2 years — change to 14 for weekly runs
 
 const BASE_URL = 'https://hansard.parliament.nz';
 
-// MPs to track
 const TARGET_MPS = [
   'CHRISTOPHER LUXON',
   'NICOLA WILLIS',
@@ -105,7 +101,6 @@ function matchMP(speakerRaw) {
 
 // ── URL GENERATION ───────────────────────────────────────────────────────
 // Parliament sits Tuesday (2), Wednesday (3), Thursday (4)
-// Generate URLs for all potential sitting days in range
 
 function getSittingDayUrls(daysBack) {
   const urls = [];
@@ -130,12 +125,11 @@ function getSittingDayUrls(daysBack) {
 }
 
 // ── SPEECH PARSER ────────────────────────────────────────────────────────
-// Handles Hansard format:
-// SPEAKER NAME (Role/Party—Electorate) (HH:MM): Speech text...
 
 function parseSpeeches(fullText) {
   const speeches = [];
 
+  // Match Hansard format: ALL CAPS NAME (role) (time): speech text
   const speechRegex = /^([A-Z][A-Z\s\-\.\']+?)\s*\([^)]*\)\s*(?:\([0-9]{2}:[0-9]{2}\))?\s*(?:to [^:]+)?:\s*([\s\S]+?)(?=\n[A-Z][A-Z\s\-\.\']{4,}\s*\(|$)/gm;
 
   let match;
@@ -143,7 +137,6 @@ function parseSpeeches(fullText) {
     const speakerRaw = match[1].trim();
     const text = match[2].trim().replace(/\n+/g, ' ');
 
-    // Skip short content and procedural speakers
     if (text.split(' ').length < 25) continue;
     if (['SPEAKER', 'CLERK', 'CHAIRPERSON', 'ASSISTANT SPEAKER'].some(s => speakerRaw.includes(s))) continue;
 
@@ -201,21 +194,31 @@ async function scrapeDay(page, { url, date, title }) {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Wait for content to render — hansard.parliament.nz is a JS app
-    // Try to wait for speech content to appear
+    // Blazor WebAssembly takes time to boot and fetch data
+    // Poll until the page has real content — not just the loading spinner
     try {
-      await page.waitForSelector('p, .speech, .contribution, [class*="debate"]', { timeout: 15000 });
+      await page.waitForFunction(
+        () => {
+          const text = document.body.innerText || '';
+          return (
+            text.length > 2000 &&
+            !text.includes('Loading...') &&
+            !text.includes('An unhandled error')
+          );
+        },
+        { timeout: 45000, polling: 1500 }
+      );
     } catch {
-      // Page might be empty (no sitting this day) — that's fine
+      // Timed out — no sitting this day or page failed to load
+      return { skipped: true, reason: 'no content' };
     }
 
+    // Small buffer after content appears to let late-rendering elements settle
     await sleep(DELAY_MS);
 
-    // Check if there's actual content
     const bodyText = await page.evaluate(() => document.body.innerText);
 
-    // If the page just says Loading or has minimal content, skip it
-    if (bodyText.length < 500 || bodyText.includes('An unhandled error')) {
+    if (!bodyText || bodyText.length < 500) {
       return { skipped: true, reason: 'no content' };
     }
 
@@ -240,8 +243,8 @@ async function processDay(debateData, meta) {
 
   if (relevant.length === 0) return 0;
 
-  // Build all chunks
   const allChunkRecords = [];
+
   for (const speech of relevant) {
     const chunks = chunkText(speech.text);
     chunks.forEach((content, i) => {
@@ -259,7 +262,7 @@ async function processDay(debateData, meta) {
 
   if (allChunkRecords.length === 0) return 0;
 
-  // Batch embed
+  // Batch embed — 20 chunks per API call
   const batches = arrayBatch(allChunkRecords, BATCH_SIZE);
   let idx = 0;
 
@@ -300,18 +303,16 @@ async function run() {
 
   const page = await context.newPage();
 
-  let totalChunks = 0;
+  let totalChunks  = 0;
   let daysProcessed = 0;
-  let daysSkipped = 0;
+  let daysSkipped   = 0;
   let daysNoSitting = 0;
 
   try {
-    // Load checkpoint
     const scrapedUrls = await getScrapedUrls();
     console.log(`Checkpoint: ${scrapedUrls.size} days already indexed.\n`);
 
-    // Generate all potential sitting day URLs
-    const allUrls = getSittingDayUrls(DAYS_BACK);
+    const allUrls  = getSittingDayUrls(DAYS_BACK);
     const toScrape = allUrls.filter(l => !scrapedUrls.has(l.url));
 
     console.log(`Sitting days in range: ${allUrls.length}`);
@@ -319,7 +320,7 @@ async function run() {
     console.log(`To scrape now:         ${toScrape.length}\n`);
 
     for (let i = 0; i < toScrape.length; i++) {
-      const meta = toScrape[i];
+      const meta     = toScrape[i];
       const progress = `[${i + 1}/${toScrape.length}]`;
 
       process.stdout.write(`${progress} ${meta.date} — `);
@@ -327,13 +328,9 @@ async function run() {
       const result = await scrapeDay(page, meta);
 
       if (result.skipped) {
-        if (result.reason === 'no content') {
-          process.stdout.write(`no sitting\n`);
-          daysNoSitting++;
-        } else {
-          process.stdout.write(`error: ${result.reason}\n`);
-          daysSkipped++;
-        }
+        const reason = result.reason === 'no content' ? 'no sitting' : `error: ${result.reason}`;
+        process.stdout.write(`${reason}\n`);
+        result.reason === 'no content' ? daysNoSitting++ : daysSkipped++;
         await markUrlScraped(meta.url, 0, true);
         continue;
       }
