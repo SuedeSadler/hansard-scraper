@@ -1,15 +1,12 @@
 /**
  * Hansard Scraper — hansard.parliament.nz
  *
- * Pure Playwright approach — loads each transcript page,
- * waits for the specific HpsByToc elements to render,
- * then extracts and parses speeches.
- *
- * Features:
- * - Waits for exact DOM elements rather than text length guessing
- * - Checkpoint system — restarts pick up where they left off
- * - Batched embeddings — 20 chunks per OpenAI call
- * - Skips non-sitting days automatically
+ * Radware bot protection uses a dynamic "uzlc" token header.
+ * Strategy:
+ * 1. Playwright loads one real page
+ * 2. We intercept the network request to capture uzlc + all headers
+ * 3. Reuse those headers for all subsequent API calls via fetch
+ * 4. No browser per page — just one warm-up to get the token
  */
 
 const { chromium } = require('playwright');
@@ -24,32 +21,21 @@ const OPENAI_KEY    = process.env.OPENAI_KEY;
 const CHUNK_SIZE    = 400;
 const CHUNK_OVERLAP = 50;
 const BATCH_SIZE    = 20;
-const DELAY_MS      = 1500;
-const DAYS_BACK     = 730; // change to 14 for weekly runs
+const DELAY_MS      = 1000;
+const DAYS_BACK     = 730;
 
-const BASE_URL = 'https://hansard.parliament.nz';
+const BASE_URL    = 'https://hansard.parliament.nz';
+const API_BASE    = `${BASE_URL}/api/resources/transcript`;
+const WARMUP_DATE = '2026-06-24';
 
 const TARGET_MPS = [
-  'CHRISTOPHER LUXON',
-  'NICOLA WILLIS',
-  'WINSTON PETERS',
-  'DAVID SEYMOUR',
-  'CHRIS BISHOP',
-  'SHANE JONES',
-  'TODD MCCLAY',
-  'ERICA STANFORD',
-  'MARK MITCHELL',
-  'CHRIS HIPKINS',
-  'CARMEL SEPULONI',
-  'WILLIE JACKSON',
-  'SIMEON BROWN',
-  'JUDITH COLLINS',
-  'LOUISE UPSTON',
-  'MATT DOOCEY',
-  'TAMA POTAKA',
-  'PAUL GOLDSMITH',
-  'SHANE RETI',
-  'CASEY COSTELLO',
+  'CHRISTOPHER LUXON', 'NICOLA WILLIS', 'WINSTON PETERS',
+  'DAVID SEYMOUR', 'CHRIS BISHOP', 'SHANE JONES',
+  'TODD MCCLAY', 'ERICA STANFORD', 'MARK MITCHELL',
+  'CHRIS HIPKINS', 'CARMEL SEPULONI', 'WILLIE JACKSON',
+  'SIMEON BROWN', 'JUDITH COLLINS', 'LOUISE UPSTON',
+  'MATT DOOCEY', 'TAMA POTAKA', 'PAUL GOLDSMITH',
+  'SHANE RETI', 'CASEY COSTELLO',
 ];
 
 // ── CLIENTS ──────────────────────────────────────────────────────────────
@@ -58,9 +44,7 @@ const openai   = new OpenAI({ apiKey: OPENAI_KEY });
 
 // ── HELPERS ──────────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   const words = text.split(/\s+/).filter(Boolean);
@@ -68,7 +52,7 @@ function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   let i = 0;
   while (i < words.length) {
     const chunk = words.slice(i, i + size).join(' ');
-    if (chunk.trim().length > 0) chunks.push(chunk);
+    if (chunk.trim()) chunks.push(chunk);
     i += size - overlap;
   }
   return chunks;
@@ -76,88 +60,129 @@ function chunkText(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
 
 function arrayBatch(arr, size) {
   const batches = [];
-  for (let i = 0; i < arr.length; i += size) {
-    batches.push(arr.slice(i, i + size));
-  }
+  for (let i = 0; i < arr.length; i += size) batches.push(arr.slice(i, i + size));
   return batches;
 }
 
 function stripHtml(html) {
   return html
     .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#160;/g, ' ')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ').replace(/&#160;/g, ' ').replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ').trim();
 }
 
 function normaliseName(raw) {
   return raw
     .replace(/^(RT\s+HON|HON|DR|SIR|DAME)\s+/i, '')
     .replace(/,?\s*(KC|QC|MP)$/i, '')
-    .trim()
-    .toUpperCase();
+    .trim().toUpperCase();
 }
 
 function matchMP(speakerRaw) {
-  const normalised = normaliseName(speakerRaw);
+  const n = normaliseName(speakerRaw);
   return TARGET_MPS.find(mp => {
-    const lastName = mp.split(' ').pop();
-    return normalised.includes(lastName) || normalised === mp;
+    const last = mp.split(' ').pop();
+    return n.includes(last) || n === mp;
   }) || null;
 }
-
-// ── URL GENERATION ───────────────────────────────────────────────────────
 
 function getSittingDayDates(daysBack) {
   const dates = [];
   for (let i = 0; i <= daysBack; i++) {
     const d = new Date();
     d.setDate(d.getDate() - i);
-    const dayOfWeek = d.getDay();
-    if (![2, 3, 4].includes(dayOfWeek)) continue;
+    if (![2, 3, 4].includes(d.getDay())) continue;
     dates.push(d.toISOString().split('T')[0]);
   }
   return dates;
 }
 
-// ── SCRAPE A SINGLE DAY ──────────────────────────────────────────────────
+// ── CAPTURE HEADERS VIA PLAYWRIGHT ───────────────────────────────────────
+// Load one real page, intercept the transcript API request,
+// capture the exact headers the browser sent (including uzlc token)
 
-async function scrapeDay(page, date) {
-  const url = `${BASE_URL}/hansard-transcript/${date}?lang=en`;
+async function captureSessionHeaders() {
+  console.log('Launching browser to capture session headers...');
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-NZ',
+  });
+
+  const page = await context.newPage();
+  let capturedHeaders = null;
+
+  // Intercept all requests — wait for the transcript API call
+  page.on('request', request => {
+    const url = request.url();
+    if (url.includes('/api/resources/transcript/')) {
+      const headers = request.headers();
+      // Only capture if it has the uzlc token
+      if (headers['uzlc']) {
+        capturedHeaders = headers;
+        console.log(`  Captured uzlc token: ${headers['uzlc'].substring(0, 40)}...`);
+      }
+    }
+  });
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const warmupUrl = `${BASE_URL}/hansard-transcript/${WARMUP_DATE}?lang=en`;
+    await page.goto(warmupUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Wait specifically for HpsByToc spans — these are the speaker elements
-    // If they don't appear within 45s, there was no sitting this day
-    try {
-      await page.waitForSelector('[class*="HpsByToc"], .HpsByToc', {
-        timeout: 45000,
-      });
-    } catch {
-      return { skipped: true, reason: 'no content' };
+    // Wait for the API call to be made — up to 30 seconds
+    const start = Date.now();
+    while (!capturedHeaders && Date.now() - start < 30000) {
+      await sleep(500);
     }
 
-    // Small buffer for remaining content to render
-    await sleep(DELAY_MS);
-
-    // Extract innerHTML — we need the HTML structure for parsing
-    const html = await page.evaluate(() => document.body.innerHTML);
-
-    if (!html || html.length < 500) {
-      return { skipped: true, reason: 'no content' };
+    if (!capturedHeaders) {
+      throw new Error('Could not capture session headers — uzlc token not found');
     }
 
-    return { html, skipped: false };
+    console.log(`  Got ${Object.keys(capturedHeaders).length} headers.\n`);
+    return capturedHeaders;
 
-  } catch (err) {
-    return { skipped: true, reason: err.message };
+  } finally {
+    await browser.close();
   }
+}
+
+// ── FETCH TRANSCRIPT ─────────────────────────────────────────────────────
+
+async function fetchTranscript(date, sessionHeaders) {
+  const url = `${API_BASE}/${date}`;
+
+  const res = await fetch(url, {
+    headers: {
+      ...sessionHeaders,
+      // Override the referer to match the date we're fetching
+      'referer': `${BASE_URL}/hansard-transcript/${date}?lang=en`,
+    },
+  });
+
+  if (res.status === 404 || res.status === 204) return null;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const text = await res.text();
+
+  if (text.includes('Radware') || text.includes('uzdbm') || text.length < 200) {
+    throw new Error('bot_protection');
+  }
+
+  // Response is a JSON-encoded HTML string
+  let html = text;
+  if (text.trim().startsWith('"')) {
+    html = JSON.parse(text);
+  }
+
+  return html;
 }
 
 // ── PARSE SPEECHES ───────────────────────────────────────────────────────
@@ -165,8 +190,6 @@ async function scrapeDay(page, date) {
 function parseSpeeches(html) {
   const speeches = [];
 
-  // Target <span class="HpsByToc"> which contains speaker name + time
-  // Everything after the colon until the next speaker block is the speech
   const speakerBlockRegex = /<span[^>]*class="[^"]*HpsByToc[^"]*"[^>]*>([\s\S]+?)<\/span>\s*:([\s\S]+?)(?=<a name="member"|<span[^>]*HpsByToc|<span[^>]*HpsProceedingHeading|<span[^>]*HpsSubjectHeading|$)/gi;
 
   let match;
@@ -176,9 +199,7 @@ function parseSpeeches(html) {
 
     if (text.split(' ').length < 25) continue;
 
-    // Extract name — everything before the first (
     const namePart = speakerRaw.split('(')[0].trim();
-
     if (['SPEAKER', 'CLERK', 'CHAIRPERSON', 'ASSISTANT SPEAKER'].some(s => namePart.includes(s))) continue;
 
     speeches.push({ speakerRaw: namePart, text });
@@ -190,88 +211,62 @@ function parseSpeeches(html) {
 // ── CHECKPOINT ───────────────────────────────────────────────────────────
 
 async function getScrapedDates() {
-  const { data, error } = await supabase
-    .from('hansard_scrape_log')
-    .select('url');
-
-  if (error) {
-    console.log('No scrape log found — starting fresh.');
-    return new Set();
-  }
-
+  const { data, error } = await supabase.from('hansard_scrape_log').select('url');
+  if (error) { console.log('Starting fresh.'); return new Set(); }
   return new Set((data || []).map(r => r.url));
 }
 
 async function markDateScraped(date, chunksAdded, skipped = false) {
   await supabase.from('hansard_scrape_log').upsert({
-    url: date,
-    chunks_added: chunksAdded,
-    skipped,
+    url: date, chunks_added: chunksAdded, skipped,
     scraped_at: new Date().toISOString(),
   }, { onConflict: 'url' });
 }
 
-// ── EMBEDDINGS ───────────────────────────────────────────────────────────
+// ── EMBEDDINGS + STORAGE ─────────────────────────────────────────────────
 
 async function embedBatch(texts) {
-  const res = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: texts,
-  });
+  const res = await openai.embeddings.create({ model: 'text-embedding-3-small', input: texts });
   return res.data.map(d => d.embedding);
 }
 
-// ── STORAGE ──────────────────────────────────────────────────────────────
-
 async function storeChunks(chunks) {
-  if (chunks.length === 0) return;
+  if (!chunks.length) return;
   const { error } = await supabase.from('hansard_chunks').insert(chunks);
   if (error) console.error('  Supabase error:', error.message);
 }
 
-// ── PROCESS A DAY ────────────────────────────────────────────────────────
-
 async function processDay(date, html) {
   const speeches = parseSpeeches(html);
+  const relevant = speeches.map(s => ({ ...s, mpName: matchMP(s.speakerRaw) })).filter(s => s.mpName);
 
-  const relevant = speeches
-    .map(s => ({ ...s, mpName: matchMP(s.speakerRaw) }))
-    .filter(s => s.mpName !== null);
+  if (!relevant.length) return 0;
 
-  if (relevant.length === 0) return 0;
-
-  const allChunkRecords = [];
-
+  const allChunks = [];
   for (const speech of relevant) {
-    const chunks = chunkText(speech.text);
-    chunks.forEach((content, i) => {
-      allChunkRecords.push({
+    chunkText(speech.text).forEach((content, i) => {
+      allChunks.push({
         mp_name: speech.mpName,
         debate_title: `Hansard ${date}`,
         debate_date: date,
         debate_url: `${BASE_URL}/hansard-transcript/${date}?lang=en`,
-        chunk_index: i,
-        content,
-        embedding: null,
+        chunk_index: i, content, embedding: null,
       });
     });
   }
 
-  if (allChunkRecords.length === 0) return 0;
+  if (!allChunks.length) return 0;
 
-  const batches = arrayBatch(allChunkRecords, BATCH_SIZE);
+  const batches = arrayBatch(allChunks, BATCH_SIZE);
   let idx = 0;
-
   for (const batch of batches) {
     const embeddings = await embedBatch(batch.map(r => r.content));
-    embeddings.forEach((emb, i) => {
-      allChunkRecords[idx + i].embedding = emb;
-    });
+    embeddings.forEach((emb, i) => { allChunks[idx + i].embedding = emb; });
     idx += batch.length;
   }
 
-  await storeChunks(allChunkRecords);
-  return allChunkRecords.length;
+  await storeChunks(allChunks);
+  return allChunks.length;
 }
 
 // ── MAIN ─────────────────────────────────────────────────────────────────
@@ -281,67 +276,64 @@ async function run() {
   console.log('║       Hansard Scraper — Starting         ║');
   console.log('╚══════════════════════════════════════════╝\n');
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-    ],
-  });
+  let totalChunks = 0, daysProcessed = 0, daysNoSitting = 0, daysErrored = 0;
 
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    locale: 'en-NZ',
-  });
+  // Step 1 — capture real browser headers including uzlc token
+  const sessionHeaders = await captureSessionHeaders();
 
-  const page = await context.newPage();
+  // Step 2 — checkpoint
+  const scrapedDates = await getScrapedDates();
+  console.log(`Checkpoint: ${scrapedDates.size} days already indexed.\n`);
 
-  let totalChunks   = 0;
-  let daysProcessed = 0;
-  let daysNoSitting = 0;
-  let daysErrored   = 0;
+  const allDates = getSittingDayDates(DAYS_BACK);
+  const toScrape = allDates.filter(d => !scrapedDates.has(d));
 
-  try {
-    const scrapedDates = await getScrapedDates();
-    console.log(`Checkpoint: ${scrapedDates.size} days already indexed.\n`);
+  console.log(`Sitting days in range: ${allDates.length}`);
+  console.log(`Already scraped:       ${allDates.length - toScrape.length}`);
+  console.log(`To scrape now:         ${toScrape.length}\n`);
 
-    const allDates = getSittingDayDates(DAYS_BACK);
-    const toScrape = allDates.filter(d => !scrapedDates.has(d));
+  let refreshAttempts = 0;
 
-    console.log(`Sitting days in range: ${allDates.length}`);
-    console.log(`Already scraped:       ${allDates.length - toScrape.length}`);
-    console.log(`To scrape now:         ${toScrape.length}\n`);
+  for (let i = 0; i < toScrape.length; i++) {
+    const date = toScrape[i];
+    process.stdout.write(`[${i + 1}/${toScrape.length}] ${date} — `);
 
-    for (let i = 0; i < toScrape.length; i++) {
-      const date     = toScrape[i];
-      const progress = `[${i + 1}/${toScrape.length}]`;
+    try {
+      await sleep(DELAY_MS);
+      const html = await fetchTranscript(date, sessionHeaders);
 
-      process.stdout.write(`${progress} ${date} — `);
-
-      const result = await scrapeDay(page, date);
-
-      if (result.skipped) {
-        const reason = result.reason === 'no content' ? 'no sitting' : `error: ${result.reason}`;
-        process.stdout.write(`${reason}\n`);
-        result.reason === 'no content' ? daysNoSitting++ : daysErrored++;
+      if (!html) {
+        process.stdout.write('no sitting\n');
+        daysNoSitting++;
         await markDateScraped(date, 0, true);
         continue;
       }
 
-      const chunksAdded = await processDay(date, result.html);
+      const chunksAdded = await processDay(date, html);
       await markDateScraped(date, chunksAdded);
-
       totalChunks += chunksAdded;
       daysProcessed++;
-
       process.stdout.write(`✓ ${chunksAdded} chunks\n`);
-    }
+      refreshAttempts = 0; // reset on success
 
-  } finally {
-    await browser.close();
+    } catch (err) {
+      if (err.message === 'bot_protection' && refreshAttempts < 3) {
+        // Token expired — get a fresh one and retry
+        process.stdout.write('token expired, refreshing...\n');
+        refreshAttempts++;
+        try {
+          const fresh = await captureSessionHeaders();
+          Object.assign(sessionHeaders, fresh);
+          i--; // retry this date
+        } catch (e) {
+          process.stdout.write(`  refresh failed: ${e.message}\n`);
+          daysErrored++;
+        }
+      } else {
+        process.stdout.write(`error: ${err.message}\n`);
+        daysErrored++;
+      }
+    }
   }
 
   console.log('\n╔══════════════════════════════════════════╗');
@@ -358,29 +350,15 @@ async function run() {
 // ── QUERY ────────────────────────────────────────────────────────────────
 
 async function queryHansard(question, mpName = null, limit = 5) {
-  const res = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: [question],
-  });
+  const res = await openai.embeddings.create({ model: 'text-embedding-3-small', input: [question] });
   const embedding = res.data[0].embedding;
-
   const { data, error } = await supabase.rpc('match_hansard_chunks', {
-    query_embedding: embedding,
-    match_threshold: 0.72,
-    match_count: limit,
-    filter_mp: mpName || null,
+    query_embedding: embedding, match_threshold: 0.72,
+    match_count: limit, filter_mp: mpName || null,
   });
-
-  if (error) {
-    console.error('Query error:', error.message);
-    return [];
-  }
-
+  if (error) { console.error('Query error:', error.message); return []; }
   return data;
 }
 
 module.exports = { run, queryHansard };
-
-if (require.main === module) {
-  run().catch(console.error);
-}
+if (require.main === module) run().catch(console.error);
