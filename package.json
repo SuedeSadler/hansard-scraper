@@ -4,8 +4,7 @@
   "description": "NZ Hansard scraper for fact-checker RAG pipeline",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium --with-deps"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
