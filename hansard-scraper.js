@@ -1,19 +1,23 @@
 /**
  * Hansard Scraper — hansard.parliament.nz
  *
- * Uses the official (undocumented) transcript API directly —
- * no browser, no Playwright, just simple HTTP requests.
+ * Uses Playwright to pass Radware bot protection,
+ * extracts session cookies, then uses those cookies
+ * for direct API calls to fetch transcripts efficiently.
  *
- * API endpoint: /api/resources/transcript/YYYY-MM-DD
- * Returns HTML with speaker names in <span class="HpsByToc"> tags.
+ * Flow:
+ * 1. Playwright loads one page to get Radware cookies
+ * 2. Cookies passed to fetch() for all subsequent API calls
+ * 3. No browser needed per page — just one warm-up load
  *
  * Features:
- * - Pure HTTP — fast, lightweight, no browser needed
- * - HTML parsing with regex on known structure
+ * - Single browser session for cookie extraction
+ * - Direct API calls after cookie handshake
  * - Checkpoint system — restarts pick up where they left off
  * - Batched embeddings — 20 chunks per OpenAI call
  */
 
+const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 
@@ -25,10 +29,11 @@ const OPENAI_KEY    = process.env.OPENAI_KEY;
 const CHUNK_SIZE    = 400;
 const CHUNK_OVERLAP = 50;
 const BATCH_SIZE    = 20;
-const DELAY_MS      = 800;   // polite delay between requests
-const DAYS_BACK     = 730;   // 2 years — change to 14 for weekly runs
+const DELAY_MS      = 800;
+const DAYS_BACK     = 730; // change to 14 for weekly runs
 
-const API_BASE = 'https://hansard.parliament.nz/api/resources/transcript';
+const API_BASE    = 'https://hansard.parliament.nz/api/resources/transcript';
+const WARMUP_URL  = 'https://hansard.parliament.nz/hansard-transcript/2026-06-24?lang=en';
 
 const TARGET_MPS = [
   'CHRISTOPHER LUXON',
@@ -83,7 +88,6 @@ function arrayBatch(arr, size) {
   return batches;
 }
 
-// Strip all HTML tags and decode common entities
 function stripHtml(html) {
   return html
     .replace(/<[^>]+>/g, ' ')
@@ -92,6 +96,7 @@ function stripHtml(html) {
     .replace(/&gt;/g, '>')
     .replace(/&nbsp;/g, ' ')
     .replace(/&#160;/g, ' ')
+    .replace(/\u00a0/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -113,7 +118,6 @@ function matchMP(speakerRaw) {
 }
 
 // ── URL GENERATION ───────────────────────────────────────────────────────
-// Parliament sits Tuesday (2), Wednesday (3), Thursday (4)
 
 function getSittingDayDates(daysBack) {
   const dates = [];
@@ -122,35 +126,103 @@ function getSittingDayDates(daysBack) {
     d.setDate(d.getDate() - i);
     const dayOfWeek = d.getDay();
     if (![2, 3, 4].includes(dayOfWeek)) continue;
-    dates.push(d.toISOString().split('T')[0]); // YYYY-MM-DD
+    dates.push(d.toISOString().split('T')[0]);
   }
   return dates;
 }
 
+// ── COOKIE EXTRACTION ────────────────────────────────────────────────────
+// Load one real page with Playwright to pass Radware bot check
+// Extract all cookies and return as a header string for fetch()
+
+async function getSessionCookies() {
+  console.log('Launching browser to pass bot protection...');
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 800 },
+    locale: 'en-NZ',
+  });
+
+  const page = await context.newPage();
+
+  try {
+    // Load a real page so Radware sets its cookies
+    await page.goto(WARMUP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // Wait for Radware challenge to complete — it sets cookies then redirects
+    await page.waitForFunction(
+      () => {
+        const text = document.body.innerText || '';
+        return text.length > 500 && !text.includes('Verifying') && !text.includes('Radware');
+      },
+      { timeout: 30000, polling: 1000 }
+    ).catch(() => {
+      console.log('Radware wait timed out — proceeding with whatever cookies we have');
+    });
+
+    await sleep(2000);
+
+    // Extract all cookies from the browser context
+    const cookies = await context.cookies();
+    const cookieHeader = cookies
+      .map(c => `${c.name}=${c.value}`)
+      .join('; ');
+
+    console.log(`Got ${cookies.length} cookies from browser session.\n`);
+
+    // Also grab the user agent for consistency
+    const userAgent = await page.evaluate(() => navigator.userAgent);
+
+    return { cookieHeader, userAgent };
+
+  } finally {
+    await browser.close();
+  }
+}
+
 // ── FETCH TRANSCRIPT ─────────────────────────────────────────────────────
 
-async function fetchTranscript(date) {
+async function fetchTranscript(date, cookieHeader, userAgent) {
   const url = `${API_BASE}/${date}`;
 
   const res = await fetch(url, {
     headers: {
       'Accept': 'application/json, text/html, */*',
-      'User-Agent': 'Mozilla/5.0 (compatible; hansard-research-scraper/1.0)',
+      'Accept-Language': 'en-NZ,en;q=0.9',
+      'Referer': `https://hansard.parliament.nz/hansard-transcript/${date}?lang=en`,
+      'Origin': 'https://hansard.parliament.nz',
+      'User-Agent': userAgent,
+      'Cookie': cookieHeader,
+      'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+      'sec-ch-ua-mobile': '?0',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
     },
   });
 
-  if (res.status === 404 || res.status === 204) {
-    return null; // No sitting this day
-  }
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${date}`);
-  }
+  if (res.status === 404 || res.status === 204) return null;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const text = await res.text();
 
-  // API returns a JSON string containing HTML
-  // Unwrap it if needed
+  // Check if we got blocked again
+  if (text.includes('Radware') || text.includes('Verifying') || text.length < 200) {
+    throw new Error('Bot protection triggered — cookies may have expired');
+  }
+
+  // API returns a JSON-encoded HTML string
   let html = text;
   if (text.trim().startsWith('"')) {
     html = JSON.parse(text);
@@ -159,31 +231,25 @@ async function fetchTranscript(date) {
   return html;
 }
 
-// ── PARSE SPEECHES FROM HTML ─────────────────────────────────────────────
-// Speaker names appear in <span class="HpsByToc"> tags
-// Format: SPEAKER NAME (Role) (HH:MM)
-// Speech text follows the closing span until the next speaker
+// ── PARSE SPEECHES ───────────────────────────────────────────────────────
 
 function parseSpeeches(html) {
   const speeches = [];
 
-  // Split on speaker anchors — each <a name="member"> marks a new speaker block
-  // Then find the HpsByToc span inside which has the speaker name
+  // Speaker names are in <span class="HpsByToc"> tags
+  // Format: SPEAKER NAME (Role) (HH:MM)
   const speakerBlockRegex = /<span class="HpsByToc"[^>]*>([\s\S]+?)<\/span>\s*:([\s\S]+?)(?=<a name="member"|<span class="HpsByToc"|<span class="HpsProceedingHeading"|<span class="HpsSubjectHeading"|$)/gi;
 
   let match;
   while ((match = speakerBlockRegex.exec(html)) !== null) {
     const speakerRaw = stripHtml(match[1]).trim();
-    const speechHtml = match[2];
-    const text = stripHtml(speechHtml).trim();
+    const text = stripHtml(match[2]).trim();
 
-    // Skip short content
     if (text.split(' ').length < 25) continue;
 
-    // Extract just the name part — before the first (
+    // Extract name before first bracket
     const namePart = speakerRaw.split('(')[0].trim();
 
-    // Skip procedural speakers
     if (['SPEAKER', 'CLERK', 'CHAIRPERSON', 'ASSISTANT SPEAKER'].some(s => namePart.includes(s))) continue;
 
     speeches.push({ speakerRaw: namePart, text });
@@ -264,7 +330,6 @@ async function processDay(date, html) {
 
   if (allChunkRecords.length === 0) return 0;
 
-  // Batch embed
   const batches = arrayBatch(allChunkRecords, BATCH_SIZE);
   let idx = 0;
 
@@ -285,7 +350,6 @@ async function processDay(date, html) {
 async function run() {
   console.log('╔══════════════════════════════════════════╗');
   console.log('║       Hansard Scraper — Starting         ║');
-  console.log('║       (API mode — no browser needed)     ║');
   console.log('╚══════════════════════════════════════════╝\n');
 
   let totalChunks   = 0;
@@ -293,16 +357,21 @@ async function run() {
   let daysNoSitting = 0;
   let daysErrored   = 0;
 
+  // Step 1 — get session cookies via Playwright
+  const { cookieHeader, userAgent } = await getSessionCookies();
+
+  // Step 2 — load checkpoint
   const scrapedDates = await getScrapedDates();
   console.log(`Checkpoint: ${scrapedDates.size} days already indexed.\n`);
 
-  const allDates  = getSittingDayDates(DAYS_BACK);
-  const toScrape  = allDates.filter(d => !scrapedDates.has(d));
+  const allDates = getSittingDayDates(DAYS_BACK);
+  const toScrape = allDates.filter(d => !scrapedDates.has(d));
 
   console.log(`Sitting days in range: ${allDates.length}`);
   console.log(`Already scraped:       ${allDates.length - toScrape.length}`);
   console.log(`To scrape now:         ${toScrape.length}\n`);
 
+  // Step 3 — fetch and process each day via API
   for (let i = 0; i < toScrape.length; i++) {
     const date     = toScrape[i];
     const progress = `[${i + 1}/${toScrape.length}]`;
@@ -312,7 +381,7 @@ async function run() {
     try {
       await sleep(DELAY_MS);
 
-      const html = await fetchTranscript(date);
+      const html = await fetchTranscript(date, cookieHeader, userAgent);
 
       if (!html) {
         process.stdout.write(`no sitting\n`);
@@ -330,8 +399,21 @@ async function run() {
       process.stdout.write(`✓ ${chunksAdded} chunks\n`);
 
     } catch (err) {
-      process.stdout.write(`error: ${err.message}\n`);
-      daysErrored++;
+      // If bot protection triggers mid-run, refresh cookies and retry once
+      if (err.message.includes('Bot protection')) {
+        console.log('\nBot protection triggered — refreshing cookies...');
+        try {
+          const fresh = await getSessionCookies();
+          Object.assign({ cookieHeader, userAgent }, fresh);
+          i--; // retry this date
+        } catch (refreshErr) {
+          process.stdout.write(`cookie refresh failed: ${refreshErr.message}\n`);
+          daysErrored++;
+        }
+      } else {
+        process.stdout.write(`error: ${err.message}\n`);
+        daysErrored++;
+      }
     }
   }
 
